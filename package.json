@@ -1,0 +1,21 @@
+{
+  "name": "live-sync",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "codegen": "convex codegen --init",
+    "dev": "convex dev",
+    "install:live": "python3 tools/install_remote_script.py",
+    "install:live:bundle": "python3 tools/install_remote_script.py --bundle",
+    "typecheck": "tsc --noEmit",
+    "test:python": "python3 -m unittest discover -s tests -p 'test_*.py'"
+  },
+  "dependencies": {
+    "@convex-dev/r2": "^0.9.1",
+    "convex": "^1.33.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}

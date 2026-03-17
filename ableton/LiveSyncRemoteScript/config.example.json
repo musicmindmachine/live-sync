@@ -1,0 +1,7 @@
+{
+  "deployment_url": "https://your-deployment.convex.cloud",
+  "site_url": "https://your-deployment.convex.site",
+  "room_id": "demo-room",
+  "client_id": "studio-a",
+  "project_root": "/absolute/path/to/your/Ableton Project"
+}
