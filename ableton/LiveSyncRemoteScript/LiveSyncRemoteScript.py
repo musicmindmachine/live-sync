@@ -28,10 +28,13 @@ except ImportError:
 
 
 class LiveSyncRemoteScript(ControlSurface):
+    _NOTE_POLL_DELAY = 15
+
     def __init__(self, c_instance) -> None:
         log_debug("LiveSyncRemoteScript.__init__ entered")
         super(LiveSyncRemoteScript, self).__init__(c_instance)
         self._service = None
+        self._note_poll_running = False
 
         try:
             self._log("Loading config.")
@@ -79,6 +82,7 @@ class LiveSyncRemoteScript(ControlSurface):
                     logger=self._log,
                 )
                 self._service.start()
+                self._start_note_poll()
                 self._log(
                     "Connected to %s for room %s as %s."
                     % (config.deployment_url, config.room_id, runtime_client_id)
@@ -87,6 +91,7 @@ class LiveSyncRemoteScript(ControlSurface):
             self._log("Initialization failed: %s" % error)
 
     def disconnect(self) -> None:
+        self._note_poll_running = False
         if self._service is not None:
             self._service.shutdown()
         self._service = None
@@ -110,3 +115,27 @@ class LiveSyncRemoteScript(ControlSurface):
     def _handle_media_ready(self) -> None:
         if self._service is not None:
             self._service.handle_media_ready()
+
+    def _start_note_poll(self) -> None:
+        if self._note_poll_running:
+            return
+        self._note_poll_running = True
+        self._schedule_note_poll()
+
+    def _schedule_note_poll(self) -> None:
+        if not self._note_poll_running or self._service is None:
+            return
+        if hasattr(self, "schedule_message"):
+            self.schedule_message(self._NOTE_POLL_DELAY, self._run_note_poll)
+        else:
+            self._run_note_poll()
+
+    def _run_note_poll(self) -> None:
+        if not self._note_poll_running or self._service is None:
+            return
+        try:
+            self._service.poll_local_state()
+        except Exception as error:
+            self._log("Note poll failed: %s" % error)
+        finally:
+            self._schedule_note_poll()

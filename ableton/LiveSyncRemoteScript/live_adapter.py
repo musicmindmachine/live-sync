@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -30,6 +31,8 @@ class LiveSongAdapter:
         self._logged_device_structure_warnings = set()
         self._logged_non_instantiable_device_structure_warnings = set()
         self._pending_browser_device_loads = set()
+        self._unsynced_non_native_device_paths = set()
+        self._last_note_probe_state: Dict[str, Optional[str]] = {}
 
     def capture_state(self) -> Dict[str, Any]:
         song = self._song_provider()
@@ -102,6 +105,7 @@ class LiveSongAdapter:
         self.stop_listening()
         self._on_change = on_change
         self._bind_all_listeners()
+        self._refresh_note_probe_state()
 
     def stop_listening(self) -> None:
         while self._listener_registrations:
@@ -111,6 +115,7 @@ class LiveSongAdapter:
             except Exception:
                 pass
         self._on_change = None
+        self._last_note_probe_state = {}
 
     def apply_snapshot(self, snapshot_state: Any) -> None:
         self._begin_suppress_changes()
@@ -126,6 +131,7 @@ class LiveSongAdapter:
             self._reconcile_device_snapshot(snapshot_state)
         finally:
             self._end_suppress_changes()
+            self._refresh_note_probe_state()
 
     def _is_snapshot_reconciled_clip_path(self, path: str) -> bool:
         if "/arrangement_clips" in path:
@@ -179,6 +185,14 @@ class LiveSongAdapter:
             self._log("Unsupported Live path: %s" % operation.path)
         finally:
             self._end_suppress_changes()
+            self._refresh_note_probe_state()
+
+    def poll_for_clip_note_changes(self) -> bool:
+        current_probe_state = self._capture_clip_note_probe_state()
+        if current_probe_state == self._last_note_probe_state:
+            return False
+        self._last_note_probe_state = current_probe_state
+        return True
 
     def filter_outbound_operations(
         self,
@@ -695,6 +709,26 @@ class LiveSongAdapter:
 
     def _snapshot_clip_notes(self, clip: Any) -> List[Dict[str, Any]]:
         return self._clip_notes_payload(clip, include_note_ids=False)
+
+    def _refresh_note_probe_state(self) -> None:
+        self._last_note_probe_state = self._capture_clip_note_probe_state()
+
+    def _capture_clip_note_probe_state(self) -> Dict[str, Optional[str]]:
+        song = self._song_provider()
+        probe_state: Dict[str, Optional[str]] = {}
+        for track_index, track in enumerate(getattr(song, "tracks", [])):
+            for slot_index, clip_slot in enumerate(getattr(track, "clip_slots", [])):
+                clip = getattr(clip_slot, "clip", None) if getattr(clip_slot, "has_clip", False) else None
+                probe_state["session:%s:%s" % (track_index, slot_index)] = self._clip_note_signature(clip)
+            for arrangement_index, clip in enumerate(self._arrangement_clips(track)):
+                probe_state["arrangement:%s:%s" % (track_index, arrangement_index)] = self._clip_note_signature(clip)
+        return probe_state
+
+    def _clip_note_signature(self, clip: Any) -> Optional[str]:
+        if clip is None or not bool(getattr(clip, "is_midi_clip", False)):
+            return None
+        notes = self._snapshot_clip_notes(clip)
+        return json.dumps(notes, sort_keys=True, separators=(",", ":"))
 
     def _snapshot_device_chain(self, container: Any, exclude_mixer: bool) -> List[Dict[str, Any]]:
         return [
@@ -1525,7 +1559,13 @@ class LiveSongAdapter:
                 continue
             target_track = target_tracks[track_index]
             desired_devices = target_track.get("devices", []) if isinstance(target_track, dict) else []
-            self._reconcile_device_chain(track, desired_devices, "track %s" % track_index, exclude_mixer=True)
+            self._reconcile_device_chain(
+                track,
+                desired_devices,
+                "track %s" % track_index,
+                exclude_mixer=True,
+                collection_path="/tracks/%s/devices" % track_index,
+            )
 
         target_return_tracks = snapshot_state.get("return_tracks", []) if isinstance(snapshot_state, dict) else []
         for track_index, track in enumerate(getattr(song, "return_tracks", [])):
@@ -1533,11 +1573,23 @@ class LiveSongAdapter:
                 continue
             target_track = target_return_tracks[track_index]
             desired_devices = target_track.get("devices", []) if isinstance(target_track, dict) else []
-            self._reconcile_device_chain(track, desired_devices, "return track %s" % track_index, exclude_mixer=True)
+            self._reconcile_device_chain(
+                track,
+                desired_devices,
+                "return track %s" % track_index,
+                exclude_mixer=True,
+                collection_path="/return_tracks/%s/devices" % track_index,
+            )
 
         target_master = snapshot_state.get("master_track", {}) if isinstance(snapshot_state, dict) else {}
         desired_master_devices = target_master.get("devices", []) if isinstance(target_master, dict) else []
-        self._reconcile_device_chain(getattr(song, "master_track", None), desired_master_devices, "master track", exclude_mixer=True)
+        self._reconcile_device_chain(
+            getattr(song, "master_track", None),
+            desired_master_devices,
+            "master track",
+            exclude_mixer=True,
+            collection_path="/master_track/devices",
+        )
 
     def _reconcile_device_chain(
         self,
@@ -1545,6 +1597,7 @@ class LiveSongAdapter:
         target_devices: Any,
         label: str,
         exclude_mixer: bool,
+        collection_path: Optional[str] = None,
     ) -> None:
         if container is None:
             return
@@ -1552,24 +1605,23 @@ class LiveSongAdapter:
         current_devices = self._device_chain_devices(container, exclude_mixer=exclude_mixer)
         current_state = [self._snapshot_device(device) for device in current_devices]
         if current_state == desired_devices:
-            return
-        if self._contains_non_instantiable_device(current_state) or self._contains_non_instantiable_device(desired_devices):
-            self._reconcile_device_properties_only(current_devices, desired_devices, label)
-            self._log_non_instantiable_device_structure_unsupported(label)
+            self._update_non_native_device_sync_status(collection_path, current_state, desired_devices, label)
             return
         if not self._supports_device_chain_mutation(container):
             self._reconcile_device_properties_only(current_devices, desired_devices, label)
+            current_devices = self._device_chain_devices(container, exclude_mixer=exclude_mixer)
+            current_state = [self._snapshot_device(device) for device in current_devices]
+            self._update_non_native_device_sync_status(collection_path, current_state, desired_devices, label)
             return
 
         for device_index, desired_device in enumerate(desired_devices):
-            current_devices = self._device_chain_devices(container, exclude_mixer=exclude_mixer)
-            current_device = current_devices[device_index] if device_index < len(current_devices) else None
-            if current_device is None or not self._can_reuse_device(current_device, desired_device):
-                if current_device is not None:
-                    self._delete_device_at_index(container, device_index, exclude_mixer, label)
-                self._insert_device_at_index(container, desired_device, device_index, exclude_mixer, label)
-                current_devices = self._device_chain_devices(container, exclude_mixer=exclude_mixer)
-                current_device = current_devices[device_index] if device_index < len(current_devices) else None
+            current_device = self._ensure_device_at_index(
+                container,
+                desired_device,
+                device_index,
+                exclude_mixer,
+                label,
+            )
             if current_device is None:
                 continue
             self._apply_device_properties(current_device, desired_device)
@@ -1578,6 +1630,9 @@ class LiveSongAdapter:
         current_devices = self._device_chain_devices(container, exclude_mixer=exclude_mixer)
         for device_index in range(len(current_devices) - 1, len(desired_devices) - 1, -1):
             self._delete_device_at_index(container, device_index, exclude_mixer, label)
+        current_devices = self._device_chain_devices(container, exclude_mixer=exclude_mixer)
+        current_state = [self._snapshot_device(device) for device in current_devices]
+        self._update_non_native_device_sync_status(collection_path, current_state, desired_devices, label)
 
     def _reconcile_device_properties_only(
         self,
@@ -1697,6 +1752,80 @@ class LiveSongAdapter:
                     self._set_parameter(send, send_value)
 
         self._reconcile_device_chain(chain, desired_chain.get("devices", []), label, exclude_mixer=False)
+
+    def _ensure_device_at_index(
+        self,
+        container: Any,
+        desired_device: Any,
+        device_index: int,
+        exclude_mixer: bool,
+        label: str,
+    ) -> Any:
+        current_devices = self._device_chain_devices(container, exclude_mixer=exclude_mixer)
+        current_device = current_devices[device_index] if device_index < len(current_devices) else None
+        if self._can_reuse_device(current_device, desired_device):
+            return current_device
+
+        matched_index = self._find_matching_device_index(current_devices, desired_device, device_index)
+        while matched_index is not None and matched_index > device_index:
+            previous_length = len(current_devices)
+            self._delete_device_at_index(container, device_index, exclude_mixer, label)
+            current_devices = self._device_chain_devices(container, exclude_mixer=exclude_mixer)
+            if len(current_devices) >= previous_length:
+                break
+            current_device = current_devices[device_index] if device_index < len(current_devices) else None
+            if self._can_reuse_device(current_device, desired_device):
+                return current_device
+            matched_index = self._find_matching_device_index(current_devices, desired_device, device_index)
+
+        current_devices = self._device_chain_devices(container, exclude_mixer=exclude_mixer)
+        current_device = current_devices[device_index] if device_index < len(current_devices) else None
+        if self._can_reuse_device(current_device, desired_device):
+            return current_device
+
+        if self._is_non_native_device_spec(desired_device):
+            self._insert_device_at_index(container, desired_device, device_index, exclude_mixer, label)
+            current_devices = self._device_chain_devices(container, exclude_mixer=exclude_mixer)
+            current_device = current_devices[device_index] if device_index < len(current_devices) else None
+            if self._can_reuse_device(current_device, desired_device):
+                return current_device
+            matched_index = self._find_matching_device_index(current_devices, desired_device, device_index)
+            while matched_index is not None and matched_index > device_index:
+                previous_length = len(current_devices)
+                self._delete_device_at_index(container, device_index, exclude_mixer, label)
+                current_devices = self._device_chain_devices(container, exclude_mixer=exclude_mixer)
+                if len(current_devices) >= previous_length:
+                    break
+                current_device = current_devices[device_index] if device_index < len(current_devices) else None
+                if self._can_reuse_device(current_device, desired_device):
+                    return current_device
+                matched_index = self._find_matching_device_index(current_devices, desired_device, device_index)
+            return None
+
+        if current_device is not None:
+            previous_length = len(current_devices)
+            self._delete_device_at_index(container, device_index, exclude_mixer, label)
+            current_devices = self._device_chain_devices(container, exclude_mixer=exclude_mixer)
+            if len(current_devices) >= previous_length:
+                return None
+
+        self._insert_device_at_index(container, desired_device, device_index, exclude_mixer, label)
+        current_devices = self._device_chain_devices(container, exclude_mixer=exclude_mixer)
+        current_device = current_devices[device_index] if device_index < len(current_devices) else None
+        if self._can_reuse_device(current_device, desired_device):
+            return current_device
+        return None
+
+    def _find_matching_device_index(
+        self,
+        current_devices: List[Any],
+        desired_device: Any,
+        start_index: int,
+    ) -> Optional[int]:
+        for candidate_index in range(max(0, start_index), len(current_devices)):
+            if self._can_reuse_device(current_devices[candidate_index], desired_device):
+                return candidate_index
+        return None
 
     def _reconcile_drum_pad_collection(self, device: Any, desired_pads: Any, label: str) -> None:
         target_pads = desired_pads if isinstance(desired_pads, list) else []
@@ -1869,6 +1998,8 @@ class LiveSongAdapter:
         if not isinstance(desired_device, dict):
             return False
         return (
+            device is not None
+            and
             str(getattr(device, "class_name", "")) == str(desired_device.get("class_name", ""))
             and str(getattr(device, "class_display_name", "")) == str(desired_device.get("class_display_name", ""))
         )
@@ -1929,6 +2060,8 @@ class LiveSongAdapter:
             for value in (previous_value, current_value, operation_value)
         ):
             return None
+        if collection_path not in self._unsynced_non_native_device_paths:
+            return None
         return self._device_structure_label_from_path(collection_path)
 
     def _device_structure_collection_path(self, path: str) -> Optional[str]:
@@ -1970,6 +2103,30 @@ class LiveSongAdapter:
                 return True
         return False
 
+    def _is_non_native_device_spec(self, desired_device: Any) -> bool:
+        if not isinstance(desired_device, dict):
+            return False
+        class_name = str(desired_device.get("class_name", ""))
+        return class_name == "PluginDevice" or class_name.startswith("MxDevice")
+
+    def _update_non_native_device_sync_status(
+        self,
+        collection_path: Optional[str],
+        current_state: Any,
+        desired_state: Any,
+        label: str,
+    ) -> None:
+        if collection_path is None:
+            return
+        needs_tracking = self._contains_non_instantiable_device(current_state) or self._contains_non_instantiable_device(
+            desired_state
+        )
+        if not needs_tracking or current_state == desired_state:
+            self._unsynced_non_native_device_paths.discard(collection_path)
+            return
+        self._unsynced_non_native_device_paths.add(collection_path)
+        self._log_non_instantiable_device_structure_unsupported(label)
+
     def _log_device_structure_unsupported(self, label: str) -> None:
         if label in self._logged_device_structure_warnings:
             return
@@ -1984,7 +2141,7 @@ class LiveSongAdapter:
             return
         self._logged_non_instantiable_device_structure_warnings.add(label)
         self._log(
-            "Skipping plug-in or Max device-chain structure sync on %s because non-native device instantiation is not reliable via the public Live API. Matching existing devices will still sync parameters."
+            "Could not fully converge plug-in or Max device-chain structure on %s. Browser-based loading is best-effort; matching existing devices will still sync parameters."
             % label
         )
 
@@ -2039,6 +2196,12 @@ class LiveSongAdapter:
                 setattr(device, "name", desired_name)
             except Exception as error:
                 self._log("Unable to rename device %s: %s" % (desired_name, error))
+
+        if "is_active" in desired_device and hasattr(device, "is_active"):
+            try:
+                setattr(device, "is_active", bool(desired_device["is_active"]))
+            except Exception as error:
+                self._log("Unable to set is_active on %s: %s" % (desired_name, error))
 
         if "selected_preset_index" in desired_device and hasattr(device, "selected_preset_index"):
             try:

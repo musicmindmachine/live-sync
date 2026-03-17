@@ -53,6 +53,21 @@ class FakeBrowser:
         self.loaded_item = item
 
 
+class FakeLoadingBrowser(FakeBrowser):
+    def __init__(self, song, plugins=None) -> None:
+        super(FakeLoadingBrowser, self).__init__(plugins=plugins)
+        self._song = song
+
+    def load_item(self, item) -> None:
+        super(FakeLoadingBrowser, self).load_item(item)
+        target_track = getattr(self._song.view, "selected_track", None)
+        if target_track is not None:
+            plugin = FakeDevice(item.name, "PluginDevice", item.name)
+            plugin.type = 4
+            plugin.parameters = []
+            target_track.devices.append(plugin)
+
+
 class FakeApplication:
     def __init__(self, browser) -> None:
         self.browser = browser
@@ -100,9 +115,50 @@ class FakeMidiClip:
         self.has_groove = False
         self.groove = None
         self.view = FakeClipView()
+        self._next_note_id = 2
+        self._notes = [
+            {
+                "note_id": 1,
+                "pitch": 36,
+                "start_time": 0.0,
+                "duration": 1.0,
+                "velocity": 100,
+                "mute": False,
+                "probability": 1.0,
+                "velocity_deviation": 0.0,
+                "release_velocity": 64,
+            }
+        ]
 
     def clear_all_envelopes(self) -> None:
         self.has_envelopes = False
+
+    def get_all_notes_extended(self):
+        return {"notes": [dict(note) for note in self._notes]}
+
+    def add_new_notes(self, payload) -> None:
+        notes = payload.get("notes", []) if isinstance(payload, dict) else []
+        for note in notes:
+            normalized = dict(note)
+            normalized["note_id"] = self._next_note_id
+            self._next_note_id += 1
+            self._notes.append(normalized)
+
+    def remove_notes_by_id(self, note_ids) -> None:
+        note_id_set = {int(note_id) for note_id in note_ids}
+        self._notes = [note for note in self._notes if int(note.get("note_id", -1)) not in note_id_set]
+
+    def remove_notes_extended(self, pitch_start, pitch_span, time_start, time_span) -> None:
+        pitch_end = int(pitch_start) + int(pitch_span)
+        time_end = float(time_start) + float(time_span)
+        retained = []
+        for note in self._notes:
+            pitch = int(note.get("pitch", 0))
+            start_time = float(note.get("start_time", 0.0))
+            if int(pitch_start) <= pitch < pitch_end and float(time_start) <= start_time <= time_end:
+                continue
+            retained.append(note)
+        self._notes = retained
 
 
 class FakeClipSlot:
@@ -422,6 +478,46 @@ class LiveSongAdapterTests(unittest.TestCase):
 
         self.assertFalse(clip.has_envelopes)
 
+    def test_note_poll_detects_session_clip_note_edits(self) -> None:
+        song = DummySong()
+        track = FakeTrackWithClipSlots()
+        song.tracks = [track]
+        adapter = LiveSongAdapter(song)
+
+        adapter.start_listening(lambda: None)
+        self.assertFalse(adapter.poll_for_clip_note_changes())
+
+        track.clip_slots[0].clip._notes.append(
+            {
+                "note_id": 2,
+                "pitch": 43,
+                "start_time": 1.0,
+                "duration": 0.5,
+                "velocity": 92,
+                "mute": False,
+                "probability": 1.0,
+                "velocity_deviation": 0.0,
+                "release_velocity": 64,
+            }
+        )
+
+        self.assertTrue(adapter.poll_for_clip_note_changes())
+        self.assertFalse(adapter.poll_for_clip_note_changes())
+
+    def test_note_poll_detects_arrangement_clip_note_edits(self) -> None:
+        song = DummySong()
+        track = FakeTrackWithClipSlots()
+        track.arrangement_clips = [FakeMidiClip()]
+        song.tracks = [track]
+        adapter = LiveSongAdapter(song)
+
+        adapter.start_listening(lambda: None)
+        self.assertFalse(adapter.poll_for_clip_note_changes())
+
+        track.arrangement_clips[0]._notes[0]["velocity"] = 77
+
+        self.assertTrue(adapter.poll_for_clip_note_changes())
+
     def test_legacy_tracks_filter_device_structure_operations(self) -> None:
         song = DummySong()
         song.tracks = [FakeLegacyTrackWithDevices()]
@@ -450,10 +546,11 @@ class LiveSongAdapterTests(unittest.TestCase):
 
         self.assertEqual([operation.path for operation in filtered], ["/tracks/0/devices/0/parameters/0/value"])
 
-    def test_filters_unsupported_plugin_device_structure_reverts(self) -> None:
+    def test_filters_unsynced_plugin_device_structure_reverts(self) -> None:
         song = DummySong()
         song.tracks = [FakeTrackWithDevices()]
         adapter = LiveSongAdapter(song)
+        adapter._unsynced_non_native_device_paths.add("/tracks/0/devices")
         previous_state = {
             "tracks": [
                 {
@@ -490,7 +587,7 @@ class LiveSongAdapterTests(unittest.TestCase):
 
         self.assertEqual(filtered, [])
 
-    def test_filters_plugin_device_structure_additions(self) -> None:
+    def test_allows_plugin_device_structure_additions(self) -> None:
         song = DummySong()
         song.tracks = [FakeTrackWithDevices()]
         adapter = LiveSongAdapter(song)
@@ -528,7 +625,7 @@ class LiveSongAdapterTests(unittest.TestCase):
             current_state=current_state,
         )
 
-        self.assertEqual(filtered, [])
+        self.assertEqual([operation.path for operation in filtered], ["/tracks/0/devices"])
 
     def test_matching_existing_plugin_devices_still_sync_parameters(self) -> None:
         adapter = LiveSongAdapter(DummySong())
@@ -785,6 +882,34 @@ class LiveSongAdapterTests(unittest.TestCase):
 
         self.assertTrue(loaded)
         self.assertIs(browser.loaded_item, browser_item)
+
+    def test_reconciles_top_level_plugin_devices_via_browser_load(self) -> None:
+        song = DummySong()
+        track = FakeTrackWithDevices()
+        song.tracks = [track]
+        browser_item = FakeBrowserItem("Serum")
+        browser = FakeLoadingBrowser(song, plugins=[FakeBrowserItem("Plugins", children=[browser_item], is_loadable=False)])
+        adapter = LiveSongAdapter(song, application_provider=lambda: FakeApplication(browser))
+
+        adapter._reconcile_device_chain(
+            track,
+            [
+                {
+                    "name": "Serum",
+                    "class_name": "PluginDevice",
+                    "class_display_name": "Serum",
+                    "type": 4,
+                    "is_active": True,
+                    "parameters": [],
+                }
+            ],
+            "track 0",
+            exclude_mixer=True,
+            collection_path="/tracks/0/devices",
+        )
+
+        self.assertEqual([device.class_name for device in track.devices[1:]], ["PluginDevice"])
+        self.assertNotIn("/tracks/0/devices", adapter._unsynced_non_native_device_paths)
 
 
 if __name__ == "__main__":

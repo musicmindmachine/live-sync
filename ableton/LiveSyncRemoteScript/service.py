@@ -143,6 +143,19 @@ class SyncService:
     def handle_media_ready(self) -> None:
         self._reconcile_adapter_to_state(self._shadow_state)
 
+    def poll_local_state(self) -> bool:
+        poll_for_clip_note_changes = getattr(self._adapter, "poll_for_clip_note_changes", None)
+        if not callable(poll_for_clip_note_changes):
+            return False
+        try:
+            has_changes = bool(poll_for_clip_note_changes())
+        except Exception as error:
+            self._log("Local poll failed: %s" % error)
+            return False
+        if has_changes:
+            self.request_local_sync()
+        return has_changes
+
     def _push_local_changes(self) -> int:
         current_state = self._adapter.capture_state()
         local_ops, self._lamport = diff_states(

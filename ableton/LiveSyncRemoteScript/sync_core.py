@@ -49,6 +49,13 @@ def diff_states(
             )
         )
 
+    def should_replace_list_atomically(segments: List[str], previous_value: Any, current_value: Any) -> bool:
+        if not isinstance(previous_value, list) or not isinstance(current_value, list):
+            return False
+        if not segments:
+            return False
+        return segments[-1] == "notes"
+
     def walk(previous_value: Any, current_value: Any, segments: List[str]) -> None:
         if current_value is _MISSING:
             emit("delete", segments)
@@ -81,6 +88,10 @@ def diff_states(
             return
 
         if isinstance(previous_value, list) and isinstance(current_value, list):
+            if should_replace_list_atomically(segments, previous_value, current_value):
+                if previous_value != current_value:
+                    emit("set", segments, current_value)
+                return
             if len(previous_value) != len(current_value):
                 emit("set", segments, current_value)
                 return

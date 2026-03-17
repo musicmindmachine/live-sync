@@ -5,6 +5,7 @@ import unittest
 from ableton.LiveSyncRemoteScript.in_memory_backend import InMemoryConvexClient, InMemorySyncBackend
 from ableton.LiveSyncRemoteScript.mock_adapter import MockLiveAdapter
 from ableton.LiveSyncRemoteScript.service import SyncService
+from ableton.LiveSyncRemoteScript.sync_core import set_json_value
 
 
 def build_state():
@@ -96,6 +97,22 @@ class FilteringMockLiveAdapter(MockLiveAdapter):
         return [operation for operation in operations if operation.path not in self._blocked_paths]
 
 
+class PollingMockLiveAdapter(MockLiveAdapter):
+    def __init__(self, initial_state) -> None:
+        super(PollingMockLiveAdapter, self).__init__(initial_state)
+        self._pending_polled_change = False
+
+    def set_path_via_poll(self, path, value) -> None:
+        self._state = set_json_value(self._state, path, value)
+        self._pending_polled_change = True
+
+    def poll_for_clip_note_changes(self) -> bool:
+        if not self._pending_polled_change:
+            return False
+        self._pending_polled_change = False
+        return True
+
+
 class SyncServiceTests(unittest.TestCase):
     def test_nested_clip_paths_do_not_force_full_reconcile(self) -> None:
         service = SyncService(
@@ -111,6 +128,62 @@ class SyncServiceTests(unittest.TestCase):
         self.assertFalse(service._requires_full_reconcile("/tracks/0/clip_slots/0/has_stop_button"))
         self.assertTrue(service._requires_full_reconcile("/tracks/0/clip_slots/0/clip"))
         self.assertTrue(service._requires_full_reconcile("/tracks/0/clip_slots/0/has_clip"))
+
+    def test_polled_note_changes_sync_without_listener_event(self) -> None:
+        backend = InMemorySyncBackend()
+        scheduler = TestScheduler()
+        left_adapter = PollingMockLiveAdapter(build_state())
+        right_adapter = MockLiveAdapter({})
+
+        left = SyncService(
+            adapter=left_adapter,
+            client=InMemoryConvexClient(backend),
+            room_id="jam",
+            client_id="left",
+            schedule_main_thread=scheduler.schedule,
+        )
+        right = SyncService(
+            adapter=right_adapter,
+            client=InMemoryConvexClient(backend),
+            room_id="jam",
+            client_id="right",
+            schedule_main_thread=scheduler.schedule,
+        )
+
+        left.start()
+        right.start()
+        scheduler.drain()
+
+        left_adapter.set_path_via_poll(
+            "/tracks/0/clip_slots/0/clip/notes",
+            [
+                {
+                    "pitch": 36,
+                    "start_time": 0.0,
+                    "duration": 1.0,
+                    "velocity": 100,
+                    "mute": False,
+                    "probability": 1.0,
+                    "velocity_deviation": 0.0,
+                    "release_velocity": 64,
+                },
+                {
+                    "pitch": 43,
+                    "start_time": 1.0,
+                    "duration": 0.5,
+                    "velocity": 92,
+                    "mute": False,
+                    "probability": 1.0,
+                    "velocity_deviation": 0.0,
+                    "release_velocity": 64,
+                },
+            ],
+        )
+
+        self.assertTrue(left.poll_local_state())
+        scheduler.drain()
+
+        self.assertEqual(right_adapter.capture_state(), left_adapter.capture_state())
 
     def test_filtered_local_operations_do_not_revert_remote_state(self) -> None:
         backend = InMemorySyncBackend()

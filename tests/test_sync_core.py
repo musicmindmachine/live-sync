@@ -35,6 +35,54 @@ class SyncCoreTests(unittest.TestCase):
         self.assertEqual(len(ops), 1)
         self.assertEqual(ops[0].path, "/tracks")
 
+    def test_note_list_changes_replace_notes_branch(self) -> None:
+        previous = {
+            "tracks": [
+                {
+                    "clip_slots": [
+                        {
+                            "clip": {
+                                "notes": [
+                                    {
+                                        "pitch": 60,
+                                        "start_time": 0.0,
+                                        "duration": 1.0,
+                                        "velocity": 100,
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+            ]
+        }
+        current = {
+            "tracks": [
+                {
+                    "clip_slots": [
+                        {
+                            "clip": {
+                                "notes": [
+                                    {
+                                        "pitch": 60,
+                                        "start_time": 0.0,
+                                        "duration": 1.0,
+                                        "velocity": 92,
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+            ]
+        }
+
+        ops, _ = diff_states(previous, current, "left", 0)
+
+        self.assertEqual(len(ops), 1)
+        self.assertEqual(ops[0].path, "/tracks/0/clip_slots/0/clip/notes")
+        self.assertEqual(ops[0].value, current["tracks"][0]["clip_slots"][0]["clip"]["notes"])
+
     def test_lww_ignores_stale_scalar_write(self) -> None:
         state = {"song": {"tempo": 120.0}}
         clock_state = {}
