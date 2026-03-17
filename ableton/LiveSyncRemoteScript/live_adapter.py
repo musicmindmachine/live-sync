@@ -28,6 +28,7 @@ class LiveSongAdapter:
         self._configured_project_root = Path(project_root).expanduser().resolve() if project_root else None
         self._suppress_change_depth = 0
         self._logged_device_structure_warnings = set()
+        self._logged_non_instantiable_device_structure_warnings = set()
         self._pending_browser_device_loads = set()
 
     def capture_state(self) -> Dict[str, Any]:
@@ -191,8 +192,13 @@ class LiveSongAdapter:
             if label is not None:
                 self._log_device_structure_unsupported(label)
                 continue
-            if self._should_skip_unsupported_plugin_structure(operation, previous_state, current_state):
-                self._log("Skipping unsupported plug-in or Max device structure sync for %s." % operation.path)
+            non_instantiable_label = self._non_instantiable_device_structure_label(
+                operation,
+                previous_state,
+                current_state,
+            )
+            if non_instantiable_label is not None:
+                self._log_non_instantiable_device_structure_unsupported(non_instantiable_label)
                 continue
             filtered.append(operation)
         return filtered
@@ -1547,6 +1553,10 @@ class LiveSongAdapter:
         current_state = [self._snapshot_device(device) for device in current_devices]
         if current_state == desired_devices:
             return
+        if self._contains_non_instantiable_device(current_state) or self._contains_non_instantiable_device(desired_devices):
+            self._reconcile_device_properties_only(current_devices, desired_devices, label)
+            self._log_non_instantiable_device_structure_unsupported(label)
+            return
         if not self._supports_device_chain_mutation(container):
             self._reconcile_device_properties_only(current_devices, desired_devices, label)
             return
@@ -1900,30 +1910,51 @@ class LiveSongAdapter:
             return True
         return remainder[1] in ("class_name", "class_display_name", "type")
 
-    def _should_skip_unsupported_plugin_structure(
+    def _non_instantiable_device_structure_label(
         self,
         operation: Any,
         previous_state: Any,
         current_state: Any,
-    ) -> bool:
+    ) -> Optional[str]:
         if getattr(operation, "kind", None) != "set":
-            return False
-        if "/devices" not in getattr(operation, "path", ""):
-            return False
-        segments = decode_pointer(operation.path)
-        if "devices" not in segments:
-            return False
-        device_index = segments.index("devices")
-        if not self._is_device_structure_remainder(segments[device_index + 1 :]):
-            return False
-        previous_value = get_json_value(previous_state, operation.path) if previous_state is not None else None
-        current_value = get_json_value(current_state, operation.path) if current_state is not None else None
-        previous_has_non_instantiable = self._contains_non_instantiable_device(previous_value)
-        current_has_non_instantiable = (
-            self._contains_non_instantiable_device(current_value)
-            or self._contains_non_instantiable_device(getattr(operation, "value", None))
-        )
-        return previous_has_non_instantiable and not current_has_non_instantiable
+            return None
+        collection_path = self._device_structure_collection_path(getattr(operation, "path", ""))
+        if collection_path is None:
+            return None
+        previous_value = get_json_value(previous_state, collection_path) if previous_state is not None else None
+        current_value = get_json_value(current_state, collection_path) if current_state is not None else None
+        operation_value = getattr(operation, "value", None)
+        if not any(
+            self._contains_non_instantiable_device(value)
+            for value in (previous_value, current_value, operation_value)
+        ):
+            return None
+        return self._device_structure_label_from_path(collection_path)
+
+    def _device_structure_collection_path(self, path: str) -> Optional[str]:
+        segments = decode_pointer(path)
+        for device_index in range(len(segments) - 1, -1, -1):
+            if segments[device_index] != "devices":
+                continue
+            remainder = segments[device_index + 1 :]
+            if not remainder:
+                return "/" + "/".join(segments[: device_index + 1])
+            if len(remainder) == 2 and remainder[0].isdigit() and remainder[1] in ("class_name", "class_display_name", "type"):
+                return "/" + "/".join(segments[: device_index + 1])
+        return None
+
+    def _device_structure_label_from_path(self, path: str) -> str:
+        if path.startswith("/tracks/"):
+            segments = decode_pointer(path)
+            if len(segments) >= 2:
+                return "track %s" % segments[1]
+        if path.startswith("/return_tracks/"):
+            segments = decode_pointer(path)
+            if len(segments) >= 2:
+                return "return track %s" % segments[1]
+        if path.startswith("/master_track/"):
+            return "master track"
+        return path
 
     def _contains_non_instantiable_device(self, value: Any) -> bool:
         if isinstance(value, list):
@@ -1945,6 +1976,15 @@ class LiveSongAdapter:
         self._logged_device_structure_warnings.add(label)
         self._log(
             "Skipping device-chain structure sync on %s because this Live build does not expose insert_device/delete_device."
+            % label
+        )
+
+    def _log_non_instantiable_device_structure_unsupported(self, label: str) -> None:
+        if label in self._logged_non_instantiable_device_structure_warnings:
+            return
+        self._logged_non_instantiable_device_structure_warnings.add(label)
+        self._log(
+            "Skipping plug-in or Max device-chain structure sync on %s because non-native device instantiation is not reliable via the public Live API. Matching existing devices will still sync parameters."
             % label
         )
 

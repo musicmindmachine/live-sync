@@ -490,7 +490,7 @@ class LiveSongAdapterTests(unittest.TestCase):
 
         self.assertEqual(filtered, [])
 
-    def test_allows_plugin_device_structure_additions(self) -> None:
+    def test_filters_plugin_device_structure_additions(self) -> None:
         song = DummySong()
         song.tracks = [FakeTrackWithDevices()]
         adapter = LiveSongAdapter(song)
@@ -528,7 +528,44 @@ class LiveSongAdapterTests(unittest.TestCase):
             current_state=current_state,
         )
 
-        self.assertEqual([operation.path for operation in filtered], ["/tracks/0/devices"])
+        self.assertEqual(filtered, [])
+
+    def test_matching_existing_plugin_devices_still_sync_parameters(self) -> None:
+        adapter = LiveSongAdapter(DummySong())
+        track = FakeTrackWithDevices()
+        plugin = FakeDevice("Serum", "PluginDevice", "Serum")
+        plugin.parameters = [FakeParameter("Cutoff", 0.25)]
+        track.devices.append(plugin)
+
+        adapter._reconcile_device_chain(
+            track,
+            [
+                {
+                    "name": "Serum",
+                    "class_name": "PluginDevice",
+                    "class_display_name": "Serum",
+                    "type": 4,
+                    "is_active": True,
+                    "parameters": [
+                        {
+                            "name": "Cutoff",
+                            "original_name": "Cutoff",
+                            "value": 0.8,
+                            "is_enabled": True,
+                            "state": 0,
+                            "min": 0.0,
+                            "max": 1.0,
+                            "is_quantized": False,
+                        }
+                    ],
+                }
+            ],
+            "track 0",
+            exclude_mixer=True,
+        )
+
+        self.assertEqual([device.class_name for device in track.devices[1:]], ["PluginDevice"])
+        self.assertAlmostEqual(track.devices[1].parameters[0].value, 0.8)
 
     def test_legacy_tracks_only_apply_device_properties(self) -> None:
         adapter = LiveSongAdapter(DummySong())
