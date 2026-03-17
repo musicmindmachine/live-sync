@@ -1,3 +1,4 @@
+import json
 import unittest
 from typing import Optional
 
@@ -159,6 +160,45 @@ class FakeMidiClip:
                 continue
             retained.append(note)
         self._notes = retained
+
+
+class FakeMidiClipWithRangeNotes(FakeMidiClip):
+    def get_all_notes_extended(self):
+        raise AttributeError("get_all_notes_extended unavailable")
+
+    def get_notes_extended(self, pitch_start, pitch_span, time_start, time_span):
+        pitch_end = int(pitch_start) + int(pitch_span)
+        time_end = float(time_start) + float(time_span)
+        notes = []
+        for note in self._notes:
+            pitch = int(note.get("pitch", 0))
+            start_time = float(note.get("start_time", 0.0))
+            if int(pitch_start) <= pitch < pitch_end and float(time_start) <= start_time <= time_end:
+                notes.append(dict(note))
+        return {"notes": notes}
+
+
+class FakeNoteObject:
+    def __init__(self, note: dict) -> None:
+        self.note_id = note.get("note_id")
+        self.pitch = note.get("pitch")
+        self.start_time = note.get("start_time")
+        self.duration = note.get("duration")
+        self.velocity = note.get("velocity")
+        self.mute = note.get("mute")
+        self.probability = note.get("probability")
+        self.velocity_deviation = note.get("velocity_deviation")
+        self.release_velocity = note.get("release_velocity")
+
+
+class FakeMidiClipWithJsonStringNotes(FakeMidiClip):
+    def get_all_notes_extended(self):
+        return json.dumps({"notes": [dict(note) for note in self._notes]})
+
+
+class FakeMidiClipWithObjectNotes(FakeMidiClip):
+    def get_all_notes_extended(self):
+        return {"notes": [FakeNoteObject(note) for note in self._notes]}
 
 
 class FakeClipSlot:
@@ -517,6 +557,33 @@ class LiveSongAdapterTests(unittest.TestCase):
         track.arrangement_clips[0]._notes[0]["velocity"] = 77
 
         self.assertTrue(adapter.poll_for_clip_note_changes())
+
+    def test_snapshot_clip_notes_falls_back_to_get_notes_extended(self) -> None:
+        adapter = LiveSongAdapter(DummySong())
+        clip = FakeMidiClipWithRangeNotes()
+
+        notes = adapter._snapshot_clip_notes(clip)
+
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0]["pitch"], 36)
+
+    def test_snapshot_clip_notes_parses_json_string_payload(self) -> None:
+        adapter = LiveSongAdapter(DummySong())
+        clip = FakeMidiClipWithJsonStringNotes()
+
+        notes = adapter._snapshot_clip_notes(clip)
+
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0]["pitch"], 36)
+
+    def test_snapshot_clip_notes_normalizes_object_notes(self) -> None:
+        adapter = LiveSongAdapter(DummySong())
+        clip = FakeMidiClipWithObjectNotes()
+
+        notes = adapter._snapshot_clip_notes(clip)
+
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0]["pitch"], 36)
 
     def test_legacy_tracks_filter_device_structure_operations(self) -> None:
         song = DummySong()

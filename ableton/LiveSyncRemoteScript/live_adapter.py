@@ -33,6 +33,7 @@ class LiveSongAdapter:
         self._pending_browser_device_loads = set()
         self._unsynced_non_native_device_paths = set()
         self._last_note_probe_state: Dict[str, Optional[str]] = {}
+        self._logged_note_api_messages = set()
 
     def capture_state(self) -> Dict[str, Any]:
         song = self._song_provider()
@@ -191,7 +192,16 @@ class LiveSongAdapter:
         current_probe_state = self._capture_clip_note_probe_state()
         if current_probe_state == self._last_note_probe_state:
             return False
+        changed_locations = [
+            location
+            for location in sorted(set(self._last_note_probe_state.keys()) | set(current_probe_state.keys()))
+            if self._last_note_probe_state.get(location) != current_probe_state.get(location)
+        ]
         self._last_note_probe_state = current_probe_state
+        self._log(
+            "Detected clip-note change via poll on %s."
+            % self._summarize_locations(changed_locations)
+        )
         return True
 
     def filter_outbound_operations(
@@ -831,24 +841,23 @@ class LiveSongAdapter:
         if clip is None or not bool(getattr(clip, "is_midi_clip", False)):
             return []
 
-        get_all_notes_extended = getattr(clip, "get_all_notes_extended", None)
-        if not callable(get_all_notes_extended):
-            return []
-
         try:
-            payload = get_all_notes_extended()
+            payload = self._read_clip_notes_payload(clip)
         except Exception as error:
             self._log("Unable to read clip notes: %s" % error)
             return []
 
-        notes = payload.get("notes", []) if isinstance(payload, dict) else payload
+        notes = self._extract_note_payload_items(payload)
         if not isinstance(notes, (list, tuple)):
             return []
 
         normalized = [
-            self._normalize_note_payload(note, include_note_id=include_note_ids)
-            for note in notes
-            if isinstance(note, dict)
+            self._normalize_note_payload(note_payload, include_note_id=include_note_ids)
+            for note_payload in (
+                self._coerce_note_payload(note)
+                for note in notes
+            )
+            if note_payload is not None
         ]
         normalized.sort(
             key=lambda note: (
@@ -863,6 +872,118 @@ class LiveSongAdapter:
             )
         )
         return normalized
+
+    def _read_clip_notes_payload(self, clip: Any) -> Any:
+        get_all_notes_extended = getattr(clip, "get_all_notes_extended", None)
+        if callable(get_all_notes_extended):
+            try:
+                return get_all_notes_extended()
+            except Exception as error:
+                self._log_note_api_message_once(
+                    "get_all_notes_extended_failed",
+                    "get_all_notes_extended() failed; falling back to get_notes_extended(...) when available: %s"
+                    % error,
+                )
+
+        get_notes_extended = getattr(clip, "get_notes_extended", None)
+        if callable(get_notes_extended):
+            self._log_note_api_message_once(
+                "get_notes_extended",
+                "get_all_notes_extended() is unavailable; falling back to get_notes_extended(...) for MIDI note sync.",
+            )
+            return get_notes_extended(0, 128, 0.0, self._clip_note_read_span(clip))
+
+        self._log_note_api_message_once(
+            "unavailable",
+            "No clip note read API is available on this Live build for MIDI note sync.",
+        )
+        return []
+
+    def _clip_note_read_span(self, clip: Any) -> float:
+        return max(
+            self._safe_number(getattr(clip, "length", 0.0)),
+            self._safe_number(getattr(clip, "loop_end", 0.0)),
+            self._safe_number(getattr(clip, "end_marker", 0.0)),
+            0.25,
+        )
+
+    def _extract_note_payload_items(self, payload: Any) -> Any:
+        normalized_payload = self._coerce_note_api_value(payload, "payload")
+        if isinstance(normalized_payload, dict):
+            notes = normalized_payload.get("notes", [])
+        elif hasattr(normalized_payload, "notes"):
+            notes = getattr(normalized_payload, "notes")
+        else:
+            notes = normalized_payload
+
+        normalized_notes = self._coerce_note_api_value(notes, "notes")
+        if isinstance(normalized_notes, dict):
+            return normalized_notes.get("notes", [])
+        return normalized_notes
+
+    def _coerce_note_api_value(self, value: Any, label: str) -> Any:
+        if isinstance(value, bytes):
+            try:
+                value = value.decode("utf-8")
+            except Exception:
+                return value
+        if not isinstance(value, str):
+            return value
+        stripped = value.strip()
+        if not stripped:
+            return []
+        try:
+            parsed = json.loads(stripped)
+        except Exception as error:
+            self._log_note_api_message_once(
+                "note_api_json_parse_%s" % label,
+                "Unable to parse MIDI note %s payload as JSON: %s" % (label, error),
+            )
+            return value
+        self._log_note_api_message_once(
+            "note_api_json_payload_%s" % label,
+            "Parsed MIDI note %s payload from JSON text." % label,
+        )
+        return parsed
+
+    def _coerce_note_payload(self, note: Any) -> Optional[Dict[str, Any]]:
+        note = self._coerce_note_api_value(note, "note")
+        if isinstance(note, dict):
+            return note
+        if hasattr(note, "items"):
+            try:
+                coerced = dict(note.items())
+            except Exception:
+                coerced = None
+            if isinstance(coerced, dict) and coerced:
+                return coerced
+        attribute_keys = (
+            "note_id",
+            "pitch",
+            "start_time",
+            "duration",
+            "velocity",
+            "mute",
+            "probability",
+            "velocity_deviation",
+            "release_velocity",
+        )
+        attribute_payload = {
+            key: getattr(note, key)
+            for key in attribute_keys
+            if hasattr(note, key)
+        }
+        if attribute_payload:
+            self._log_note_api_message_once(
+                "note_api_object_payload",
+                "Normalized MIDI note entries from Live object attributes.",
+            )
+            return attribute_payload
+        self._log_note_api_message_once(
+            "note_api_unsupported_%s" % type(note).__name__,
+            "Unsupported MIDI note entry type %s; skipping those notes." % type(note).__name__,
+        )
+        return None
 
     def _normalize_note_payload(self, note: Dict[str, Any], include_note_id: bool) -> Dict[str, Any]:
         normalized = {
@@ -2311,16 +2432,21 @@ class LiveSongAdapter:
     def _try_load_non_native_device(self, container: Any, desired_device: Any, device_index: int, label: str) -> bool:
         if not isinstance(desired_device, dict):
             return False
+        device_name = str(desired_device.get("class_display_name", "") or desired_device.get("name", ""))
+        self._log(
+            "Attempting non-native device load for %s on %s at index %s."
+            % (device_name or "<unnamed>", label, device_index)
+        )
         target_track = self._browser_load_target_track(container)
         if target_track is None:
             self._log("Browser loading is only supported for top-level track chains right now: %s." % label)
             return False
 
-        device_name = str(desired_device.get("class_display_name", "") or desired_device.get("name", ""))
         if not device_name:
             return False
         pending_key = (label, device_name, device_index)
         if pending_key in self._pending_browser_device_loads:
+            self._log("Non-native device load already pending for %s on %s." % (device_name, label))
             return True
 
         application = self._application()
@@ -2477,3 +2603,16 @@ class LiveSongAdapter:
 
     def _log(self, message: str) -> None:
         self._logger("LiveSync: %s" % message)
+
+    def _summarize_locations(self, locations: List[str], limit: int = 8) -> str:
+        if not locations:
+            return "(unknown clip)"
+        if len(locations) <= limit:
+            return ", ".join(locations)
+        return "%s ... (+%s more)" % (", ".join(locations[:limit]), len(locations) - limit)
+
+    def _log_note_api_message_once(self, key: str, message: str) -> None:
+        if key in self._logged_note_api_messages:
+            return
+        self._logged_note_api_messages.add(key)
+        self._log(message)

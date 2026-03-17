@@ -153,6 +153,7 @@ class SyncService:
             self._log("Local poll failed: %s" % error)
             return False
         if has_changes:
+            self._log("Local note poll detected a clip-note change; scheduling sync.")
             self.request_local_sync()
         return has_changes
 
@@ -164,6 +165,12 @@ class SyncService:
             self._client_id,
             self._lamport,
         )
+        pre_filter_ops = list(local_ops)
+        if pre_filter_ops:
+            self._log(
+                "Local diff produced %s op(s): %s"
+                % (len(pre_filter_ops), self._summarize_operation_paths(pre_filter_ops))
+            )
         filter_outbound_operations = getattr(self._adapter, "filter_outbound_operations", None)
         if callable(filter_outbound_operations):
             local_ops = filter_outbound_operations(
@@ -171,14 +178,29 @@ class SyncService:
                 previous_state=self._shadow_state,
                 current_state=current_state,
             )
+            if len(local_ops) != len(pre_filter_ops):
+                self._log(
+                    "Filtered outbound ops from %s to %s. Dropped: %s"
+                    % (
+                        len(pre_filter_ops),
+                        len(local_ops),
+                        self._summarize_paths(self._dropped_paths(pre_filter_ops, local_ops)),
+                    )
+                )
 
         if not local_ops:
+            if pre_filter_ops:
+                self._log("All local ops were filtered; nothing will be pushed.")
             return 0
 
         result = self._client.push_ops(self._room_id, self._client_id, local_ops)
         self._last_sequence = max(self._last_sequence, result.last_sequence)
         self._lamport = max(self._lamport, result.max_lamport)
         self._apply_push_result(result, current_state)
+        self._log(
+            "Pushed %s op(s); accepted=%s last_sequence=%s."
+            % (len(local_ops), len(result.accepted), result.last_sequence)
+        )
         return len([item for item in result.accepted if item.applied])
 
     def _pull_remote_once(self) -> int:
@@ -308,6 +330,28 @@ class SyncService:
 
     def _log(self, message: str) -> None:
         self._logger("LiveSync: %s" % message)
+
+    def _dropped_paths(self, before_ops: Any, after_ops: Any) -> list:
+        remaining_paths = [getattr(operation, "path", "") for operation in after_ops]
+        dropped_paths = []
+        for operation in before_ops:
+            path = getattr(operation, "path", "")
+            if path in remaining_paths:
+                remaining_paths.remove(path)
+                continue
+            dropped_paths.append(path)
+        return dropped_paths
+
+    def _summarize_operation_paths(self, operations: Any, limit: int = 12) -> str:
+        return self._summarize_paths([getattr(operation, "path", "") for operation in operations], limit=limit)
+
+    def _summarize_paths(self, paths: Any, limit: int = 12) -> str:
+        path_list = [str(path) for path in paths if path]
+        if not path_list:
+            return "(none)"
+        if len(path_list) <= limit:
+            return ", ".join(path_list)
+        return "%s ... (+%s more)" % (", ".join(path_list[:limit]), len(path_list) - limit)
 
     def _reconcile_adapter_to_state(self, target_state: Any) -> None:
         current_state = self._adapter.capture_state()
