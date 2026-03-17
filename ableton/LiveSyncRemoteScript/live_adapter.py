@@ -859,19 +859,22 @@ class LiveSongAdapter:
             )
             if note_payload is not None
         ]
-        normalized.sort(
-            key=lambda note: (
-                self._safe_number(note.get("start_time", 0.0)),
-                int(note.get("pitch", 0)),
-                self._safe_number(note.get("duration", 0.0)),
-                int(note.get("velocity", 0)),
-                int(note.get("release_velocity", 0)),
-                self._safe_number(note.get("probability", 1.0)),
-                self._safe_number(note.get("velocity_deviation", 0.0)),
-                bool(note.get("mute", False)),
+        if normalized:
+            normalized.sort(
+                key=lambda note: (
+                    self._safe_number(note.get("start_time", 0.0)),
+                    int(note.get("pitch", 0)),
+                    self._safe_number(note.get("duration", 0.0)),
+                    int(note.get("velocity", 0)),
+                    int(note.get("release_velocity", 0)),
+                    self._safe_number(note.get("probability", 1.0)),
+                    self._safe_number(note.get("velocity_deviation", 0.0)),
+                    bool(note.get("mute", False)),
+                )
             )
-        )
-        return normalized
+            return normalized
+
+        return self._legacy_clip_notes_payload(clip, include_note_ids=include_note_ids)
 
     def _read_clip_notes_payload(self, clip: Any) -> Any:
         get_all_notes_extended = getattr(clip, "get_all_notes_extended", None)
@@ -950,6 +953,10 @@ class LiveSongAdapter:
         note = self._coerce_note_api_value(note, "note")
         if isinstance(note, dict):
             return note
+        if isinstance(note, (list, tuple)):
+            legacy_note = self._coerce_legacy_note_tuple(note)
+            if legacy_note is not None:
+                return legacy_note
         if hasattr(note, "items"):
             try:
                 coerced = dict(note.items())
@@ -984,6 +991,82 @@ class LiveSongAdapter:
             "Unsupported MIDI note entry type %s; skipping those notes." % type(note).__name__,
         )
         return None
+
+    def _coerce_legacy_note_tuple(self, note: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(note, (list, tuple)) or len(note) < 5:
+            return None
+        try:
+            legacy_note = {
+                "pitch": int(note[0]),
+                "start_time": self._safe_number(note[1]),
+                "duration": max(0.0, self._safe_number(note[2])),
+                "velocity": int(note[3]),
+                "mute": bool(note[4]),
+            }
+        except Exception:
+            return None
+        if len(note) >= 6:
+            legacy_note["probability"] = self._safe_number(note[5])
+        if len(note) >= 7:
+            legacy_note["velocity_deviation"] = self._safe_number(note[6])
+        if len(note) >= 8:
+            legacy_note["release_velocity"] = int(note[7])
+        if len(note) >= 9:
+            legacy_note["note_id"] = int(note[8])
+        return legacy_note
+
+    def _legacy_clip_notes_payload(self, clip: Any, include_note_ids: bool) -> List[Dict[str, Any]]:
+        select_all_notes = getattr(clip, "select_all_notes", None)
+        get_selected_notes = getattr(clip, "get_selected_notes", None)
+        if not callable(select_all_notes) or not callable(get_selected_notes):
+            return []
+
+        deselect_all_notes = getattr(clip, "deselect_all_notes", None)
+        raw_notes = []
+        try:
+            select_all_notes()
+            payload = self._coerce_note_api_value(get_selected_notes(), "legacy_notes")
+            if isinstance(payload, (list, tuple)):
+                raw_notes = list(payload)
+        except Exception as error:
+            self._log_note_api_message_once(
+                "legacy_note_read_failed",
+                "Legacy MIDI note fallback failed while reading selected notes: %s" % error,
+            )
+            return []
+        finally:
+            if callable(deselect_all_notes):
+                try:
+                    deselect_all_notes()
+                except Exception:
+                    pass
+
+        normalized = [
+            self._normalize_note_payload(note_payload, include_note_id=include_note_ids)
+            for note_payload in (
+                self._coerce_note_payload(note)
+                for note in raw_notes
+            )
+            if note_payload is not None
+        ]
+        if normalized:
+            self._log_note_api_message_once(
+                "legacy_note_read",
+                "Using legacy select_all_notes/get_selected_notes MIDI read fallback.",
+            )
+        normalized.sort(
+            key=lambda note: (
+                self._safe_number(note.get("start_time", 0.0)),
+                int(note.get("pitch", 0)),
+                self._safe_number(note.get("duration", 0.0)),
+                int(note.get("velocity", 0)),
+                int(note.get("release_velocity", 0)),
+                self._safe_number(note.get("probability", 1.0)),
+                self._safe_number(note.get("velocity_deviation", 0.0)),
+                bool(note.get("mute", False)),
+            )
+        )
+        return normalized
 
     def _normalize_note_payload(self, note: Dict[str, Any], include_note_id: bool) -> Dict[str, Any]:
         normalized = {
@@ -1589,8 +1672,30 @@ class LiveSongAdapter:
         if callable(add_new_notes) and desired_notes:
             try:
                 add_new_notes({"notes": self._strip_note_ids(desired_notes)})
+                return
             except Exception as error:
                 self._log("Unable to add clip notes: %s" % error)
+
+        replace_selected_notes = getattr(clip, "replace_selected_notes", None)
+        select_all_notes = getattr(clip, "select_all_notes", None)
+        deselect_all_notes = getattr(clip, "deselect_all_notes", None)
+        if callable(replace_selected_notes):
+            try:
+                if callable(select_all_notes):
+                    select_all_notes()
+                replace_selected_notes(self._legacy_note_tuples(desired_notes))
+                self._log_note_api_message_once(
+                    "legacy_note_write",
+                    "Using legacy replace_selected_notes MIDI write fallback.",
+                )
+            except Exception as error:
+                self._log("Unable to replace clip notes via legacy API: %s" % error)
+            finally:
+                if callable(deselect_all_notes):
+                    try:
+                        deselect_all_notes()
+                    except Exception:
+                        pass
 
     def _strip_note_ids(self, notes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         return [
@@ -1601,6 +1706,18 @@ class LiveSongAdapter:
             }
             for note in notes
         ]
+
+    def _legacy_note_tuples(self, notes: List[Dict[str, Any]]) -> tuple:
+        return tuple(
+            (
+                int(note.get("pitch", 60)),
+                self._safe_number(note.get("start_time", 0.0)),
+                max(0.0, self._safe_number(note.get("duration", 0.0))),
+                int(note.get("velocity", 100)),
+                bool(note.get("mute", False)),
+            )
+            for note in notes
+        )
 
     def _clip_creation_length(self, clip_spec: Dict[str, Any]) -> float:
         explicit_length = self._safe_number(clip_spec.get("length", 0.0))

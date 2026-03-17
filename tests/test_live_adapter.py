@@ -201,6 +201,45 @@ class FakeMidiClipWithObjectNotes(FakeMidiClip):
         return {"notes": [FakeNoteObject(note) for note in self._notes]}
 
 
+class FakeMidiClipWithLegacyNotes(FakeMidiClip):
+    def get_all_notes_extended(self):
+        return {"notes": []}
+
+    def select_all_notes(self) -> None:
+        return None
+
+    def deselect_all_notes(self) -> None:
+        return None
+
+    def get_selected_notes(self):
+        return tuple(
+            (
+                int(note.get("pitch", 60)),
+                float(note.get("start_time", 0.0)),
+                float(note.get("duration", 0.0)),
+                int(note.get("velocity", 100)),
+                bool(note.get("mute", False)),
+            )
+            for note in self._notes
+        )
+
+    def replace_selected_notes(self, notes) -> None:
+        self._notes = []
+        for note_tuple in notes:
+            self._notes.append(
+                {
+                    "pitch": int(note_tuple[0]),
+                    "start_time": float(note_tuple[1]),
+                    "duration": float(note_tuple[2]),
+                    "velocity": int(note_tuple[3]),
+                    "mute": bool(note_tuple[4]),
+                    "probability": 1.0,
+                    "velocity_deviation": 0.0,
+                    "release_velocity": 64,
+                }
+            )
+
+
 class FakeClipSlot:
     def __init__(self) -> None:
         self.has_clip = True
@@ -584,6 +623,36 @@ class LiveSongAdapterTests(unittest.TestCase):
 
         self.assertEqual(len(notes), 1)
         self.assertEqual(notes[0]["pitch"], 36)
+
+    def test_snapshot_clip_notes_falls_back_to_legacy_selected_notes(self) -> None:
+        adapter = LiveSongAdapter(DummySong())
+        clip = FakeMidiClipWithLegacyNotes()
+
+        notes = adapter._snapshot_clip_notes(clip)
+
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0]["pitch"], 36)
+
+    def test_replace_clip_notes_falls_back_to_legacy_replace_selected_notes(self) -> None:
+        adapter = LiveSongAdapter(DummySong())
+        clip = FakeMidiClipWithLegacyNotes()
+        clip._notes = []
+
+        adapter._replace_clip_notes(
+            clip,
+            [
+                {
+                    "pitch": 40,
+                    "start_time": 0.5,
+                    "duration": 0.25,
+                    "velocity": 96,
+                    "mute": False,
+                }
+            ],
+        )
+
+        self.assertEqual(len(clip._notes), 1)
+        self.assertEqual(clip._notes[0]["pitch"], 40)
 
     def test_legacy_tracks_filter_device_structure_operations(self) -> None:
         song = DummySong()
